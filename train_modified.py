@@ -17,21 +17,44 @@ from pytorch_msssim import ms_ssim
 from models import TCM
 from torch.utils.tensorboard import SummaryWriter   
 import os
+from torchvision.models import vgg16
+import torch.nn.functional as F
 
 torch.backends.cudnn.deterministic=True
 torch.backends.cudnn.benchmark=False
 
-def compute_msssim(a, b):
-    return ms_ssim(a, b, data_range=1.)
+# VGG Perceptual Loss
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, device='cuda'):
+        super().__init__()
+        vgg = vgg16(pretrained=True).features[:16]  # Use conv1_1 to conv3_3
+        for param in vgg.parameters():
+            param.requires_grad = False
+        self.vgg = vgg.to(device)
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
 
-class RateDistortionLoss(nn.Module):
-    """Custom rate distortion loss with a Lagrangian parameter."""
+    def forward(self, x, y):
+        x = self.normalize(x)
+        y = self.normalize(y)
+        return F.mse_loss(self.vgg(x), self.vgg(y))
 
-    def __init__(self, lmbda=1e-2, type='mse'):
+# MS-SSIM
+def compute_msssim(x, y):
+    return ms_ssim(x, y, data_range=1.)
+
+# Hybrid Rate-Distortion Loss
+class HybridRateDistortionLoss(nn.Module):
+    def __init__(self, lmbda=1e-2, lambda_mse=1.0, lambda_msssim=1.0, lambda_vgg=0.01, device='cuda'):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
-        self.type = type
+        self.lambda_mse = lambda_mse
+        self.lambda_msssim = lambda_msssim
+        self.lambda_vgg = lambda_vgg
+        self.vgg_loss = VGGPerceptualLoss(device=device)
 
     def forward(self, output, target):
         N, _, H, W = target.size()
@@ -42,14 +65,51 @@ class RateDistortionLoss(nn.Module):
             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
             for likelihoods in output["likelihoods"].values()
         )
-        if self.type == 'mse':
-            out["mse_loss"] = self.mse(output["x_hat"], target)
-            out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
-        else:
-            out['ms_ssim_loss'] = compute_msssim(output["x_hat"], target)
-            out["loss"] = self.lmbda * (1 - out['ms_ssim_loss']) + out["bpp_loss"]
 
+        x_hat = output["x_hat"].clamp(0, 1)
+
+        mse = self.mse(x_hat, target)
+        msssim_val = compute_msssim(x_hat, target)
+        vgg = self.vgg_loss(x_hat, target)
+
+        out["mse_loss"] = mse
+        out["ms_ssim_loss"] = msssim_val
+        out["vgg_loss"] = vgg
+
+        out["loss"] = out["bpp_loss"] + self.lmbda * (
+            self.lambda_mse * 255 ** 2 * mse + 
+            self.lambda_msssim * (1 - msssim_val) + 
+            self.lambda_vgg * vgg
+        )
         return out
+
+
+# class RateDistortionLoss(nn.Module):
+#     """Custom rate distortion loss with a Lagrangian parameter."""
+
+#     def __init__(self, lmbda=1e-2, type='mse'):
+#         super().__init__()
+#         self.mse = nn.MSELoss()
+#         self.lmbda = lmbda
+#         self.type = type
+
+#     def forward(self, output, target):
+#         N, _, H, W = target.size()
+#         out = {}
+#         num_pixels = N * H * W
+
+#         out["bpp_loss"] = sum(
+#             (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+#             for likelihoods in output["likelihoods"].values()
+#         )
+#         if self.type == 'mse':
+#             out["mse_loss"] = self.mse(output["x_hat"], target)
+#             out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
+#         else:
+#             out['ms_ssim_loss'] = compute_msssim(output["x_hat"], target)
+#             out["loss"] = self.lmbda * (1 - out['ms_ssim_loss']) + out["bpp_loss"]
+
+#         return out
 
 
 class AverageMeter:
@@ -113,7 +173,7 @@ def configure_optimizers(net, args):
 
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, type='mse'
+    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, type='hybrid'
 ):
     model.train()
     device = next(model.parameters()).device
@@ -146,6 +206,18 @@ def train_one_epoch(
                     f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
                     f"\tAux loss: {aux_loss.item():.2f}"
                 )
+            elif type == 'hybrid':
+                print(
+                    f"Train epoch {epoch}: ["
+                    f"{i*len(d)}/{len(train_dataloader.dataset)}"
+                    f" ({100. * i / len(train_dataloader):.0f}%)]"
+                    f'\tLoss: {out_criterion["loss"].item():.3f} |'
+                    f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
+                    f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.3f} |'
+                    f'\tVGG loss: {out_criterion["vgg_loss"].item():.3f} |'
+                    f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
+                    f"\tAux loss: {aux_loss.item():.2f}"
+                )
             else:
                 print(
                     f"Train epoch {epoch}: ["
@@ -158,7 +230,7 @@ def train_one_epoch(
                 )
 
 
-def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
+def test_epoch(epoch, test_dataloader, model, criterion, type='hybrid'):
     model.eval()
     device = next(model.parameters()).device
     if type == 'mse':
@@ -185,7 +257,38 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
             f"\tBpp loss: {bpp_loss.avg:.2f} |"
             f"\tAux loss: {aux_loss.avg:.2f}\n"
         )
+    
+    elif type == 'hybrid':
+        loss = AverageMeter()
+        bpp_loss = AverageMeter()
+        mse_loss = AverageMeter()
+        ms_ssim_loss = AverageMeter()
+        vgg_loss = AverageMeter()
+        aux_loss = AverageMeter()
 
+        with torch.no_grad():
+            for d in test_dataloader:
+                d = d.to(device)
+                out_net = model(d)
+                out_criterion = criterion(out_net, d)
+
+                aux_loss.update(model.aux_loss())
+                bpp_loss.update(out_criterion["bpp_loss"])
+                loss.update(out_criterion["loss"])
+                mse_loss.update(out_criterion["mse_loss"])
+                ms_ssim_loss.update(out_criterion["ms_ssim_loss"])
+                vgg_loss.update(out_criterion["vgg_loss"])
+
+        print(
+            f"Test epoch {epoch}: Average losses:"
+            f"\tLoss: {loss.avg:.3f} |"
+            f"\tMSE loss: {mse_loss.avg:.3f} |"
+            f"\tMS_SSIM loss: {ms_ssim_loss.avg:.3f} |"
+            f"\tVGG loss: {vgg_loss.avg:.3f} |"
+            f"\tBpp loss: {bpp_loss.avg:.2f} |"
+            f"\tAux loss: {aux_loss.avg:.2f}\n"
+        )
+    
     else:
         loss = AverageMeter()
         bpp_loss = AverageMeter()
@@ -297,7 +400,7 @@ def parse_args(argv):
         help="gradient clipping max norm (default: %(default)s",
     )
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
-    parser.add_argument("--type", type=str, default='mse', help="loss type", choices=['mse', "ms-ssim"])
+    parser.add_argument("--type", type=str, default='hybrid', help="loss type", choices=['mse', "ms-ssim", "hybrid"])
     parser.add_argument("--save_path", type=str, help="save_path")
     parser.add_argument(
         "--skip_epoch", type=int, default=0
@@ -372,7 +475,7 @@ def main(argv):
     print("milestones: ", milestones)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
 
-    criterion = RateDistortionLoss(lmbda=args.lmbda, type=type)
+    criterion = HybridRateDistortionLoss(lmbda=args.lmbda)
 
     last_epoch = 0
     if args.checkpoint:  # load from previous checkpoint
