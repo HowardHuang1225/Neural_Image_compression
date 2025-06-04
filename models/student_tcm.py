@@ -307,8 +307,8 @@ class SwinBlock(nn.Module):
             x = F.pad(x, (-padding_col, -padding_col-1, -padding_row, -padding_row-1))
         return trans_x
 
-class TCM(CompressionModel):
-    def __init__(self, config=[2, 2, 2, 2, 2, 2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0, N=128,  M=160, num_slices=5, max_support_slices=5, **kwargs):
+class student_TCM(CompressionModel):
+    def __init__(self, config=[1, 1, 1, 1, 1, 1], head_dim=[4, 8, 16, 16, 8, 4], drop_path_rate=0, N=64,  M=160, num_slices=5, max_support_slices=3, **kwargs):
         super().__init__(entropy_bottleneck_channels=N)
         self.config = config
         self.head_dim = head_dim
@@ -624,3 +624,6 @@ class TCM(CompressionModel):
         x_hat = self.g_s(y_hat).clamp_(0, 1)
 
         return {"x_hat": x_hat}
+    
+
+
